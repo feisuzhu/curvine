@@ -792,6 +792,12 @@ impl TransferTaskRunner {
     fn cv_commit_attr_opts(&self, ufs_mtime: i64, mark_transfer_output: bool) -> SetAttrOpts {
         let mut attr_builder = SetAttrOptsBuilder::new().ufs_mtime(ufs_mtime);
         if mark_transfer_output {
+            // The temp inode was created with TEMP_OUTPUT_TTL_MS; replace that
+            // with the job's requested policy before publishing it. Exports
+            // and replays touch an existing source and must keep its TTL.
+            attr_builder = attr_builder
+                .ttl_ms(self.task.info.job.ttl_ms)
+                .ttl_action(self.task.info.job.ttl_action);
             if let Some(report) = &self.task.info.transfer_report {
                 attr_builder = attr_builder
                     .add_x_attr(
@@ -2146,5 +2152,23 @@ mod tests {
         assert_eq!(TransferTaskRunner::parallel_progress(2048, 1024), 1024);
         assert_eq!(TransferTaskRunner::parallel_progress(-1, 1024), 0);
         assert_eq!(TransferTaskRunner::parallel_progress(7, 0), 0);
+    }
+
+    #[test]
+    fn commit_attrs_restore_the_job_ttl_only_for_published_outputs() {
+        let dir = Scratch::new("commit-ttl");
+        let mut info = task_info(&dir, "file:///src", "file:///dst", 1, true);
+        info.job.ttl_ms = 60 * 60 * 1000;
+        info.job.ttl_action = TtlAction::Delete;
+        let (runner, _rt) = test_runner(info);
+
+        let output = runner.cv_commit_attr_opts(7, true);
+        assert_eq!(output.ttl_ms, Some(60 * 60 * 1000));
+        assert_eq!(output.ttl_action, Some(TtlAction::Delete));
+
+        // Exports and replays update an existing source: keep its own TTL.
+        let source = runner.cv_commit_attr_opts(7, false);
+        assert_eq!(source.ttl_ms, None);
+        assert_eq!(source.ttl_action, None);
     }
 }
