@@ -350,6 +350,20 @@ where
             tokio::select! {
                 res = &mut plan_fut => break res,
                 _ = renew.tick() => {
+                    match self.store.get_transfer(&lease.job_id)? {
+                        Some(current)
+                            if planning_should_continue(
+                                current.state,
+                                current.cancel_requested,
+                            ) => {}
+                        _ => {
+                            info!(
+                                "stop planning transfer {} because it is no longer planning or was canceled",
+                                lease.job_id
+                            );
+                            return Ok(());
+                        }
+                    }
                     let renewed = self.store.renew_lease(
                         &lease.job_id,
                         lease.run_id,
@@ -1341,6 +1355,10 @@ fn next_scheduling_priority(
     }
 }
 
+fn planning_should_continue(state: TransferState, cancel_requested: bool) -> bool {
+    state == TransferState::Planning && !cancel_requested
+}
+
 fn planning_renew_interval(lease_timeout: Duration) -> Duration {
     // Renew at a third of the lease. Do not round up to seconds: a configured
     // subsecond lease must be renewed before it expires.
@@ -1738,6 +1756,14 @@ mod tests {
         completion.worker_exited();
 
         assert!(waiting.await.expect("waiter task panicked"));
+    }
+
+    #[test]
+    fn canceled_or_non_planning_jobs_stop_the_planner() {
+        assert!(planning_should_continue(TransferState::Planning, false));
+        assert!(!planning_should_continue(TransferState::Planning, true));
+        assert!(!planning_should_continue(TransferState::Canceling, false));
+        assert!(!planning_should_continue(TransferState::Running, false));
     }
 
     #[test]
