@@ -33,10 +33,11 @@ use curvine_model::{
 use curvine_runtime::runtime::{RpcRuntime, Runtime};
 use curvine_transfer_client::TransferClient;
 use dashmap::mapref::entry::Entry;
-use dashmap::DashMap;
 use log::{debug, info, warn};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 /// Prices that fell back to the declared pipeline bytes (stat error, no UFS).
@@ -75,7 +76,7 @@ pub struct TaskManager {
     /// Adaptive in-flight byte admission; `None` when disabled.
     inflight_gate: Option<Arc<InflightBytesGate>>,
     /// Bytes already fed into the gate's goodput, per task.
-    sampled_bytes: Arc<DashMap<String, i64>>,
+    sampled_bytes: Arc<Mutex<HashMap<String, i64>>>,
 }
 
 pub struct TaskSubmitResult {
@@ -230,17 +231,21 @@ impl TaskManager {
             registry,
             factory,
             inflight_gate,
-            sampled_bytes: Arc::new(DashMap::new()),
+            sampled_bytes: Arc::new(Mutex::new(HashMap::new())),
         };
 
         if let (Some(window), Some(gate)) = (probe, mgr.inflight_gate.clone()) {
+            // `loaded_size` advances at `task_report_interval`, not at the probe
+            // window. Sample and advance the probe on the larger cadence so a
+            // 10-second byte delta is not divided by a 2-second window.
+            let sample_interval = probe_sample_interval(window, conf.job.task_report_interval);
             let tasks = mgr.tasks.clone();
             let sampled = mgr.sampled_bytes.clone();
             mgr.rt.spawn(async move {
                 loop {
-                    tokio::time::sleep(window).await;
+                    tokio::time::sleep(sample_interval).await;
                     feed_task_progress(&gate, &tasks, &sampled);
-                    if gate.probe_tick(window).is_none() && !gate.is_probing() {
+                    if gate.probe_tick(sample_interval).is_none() && !gate.is_probing() {
                         break;
                     }
                 }
@@ -395,9 +400,11 @@ impl TaskManager {
                     }
                     if let Some(gate) = &gate {
                         let size = context.progress().loaded_size;
+                        let key = sample_key(&context.info);
                         let prev = sampled_bytes
-                            .remove(&task_id)
-                            .map(|(_, bytes)| bytes)
+                            .lock()
+                            .unwrap_or_else(|err| err.into_inner())
+                            .remove(&key)
                             .unwrap_or(0);
                         gate.record_completed(size - prev);
                     }
@@ -724,17 +731,38 @@ async fn acquire_admission(
     Ok((count, bytes))
 }
 
-fn feed_task_progress(gate: &InflightBytesGate, tasks: &TaskStore, sampled: &DashMap<String, i64>) {
+/// `loaded_size` only advances on the report interval. Advancing the probe on
+/// the same cadence prevents a 10-second report from being divided by a
+/// 2-second probe window (which would overstate goodput by 5x).
+fn probe_sample_interval(probe_window: Duration, report_interval: Duration) -> Duration {
+    probe_window.max(report_interval)
+}
+
+fn sample_key(info: &TransferTaskInfo) -> String {
+    let (run_id, attempt_id) = info
+        .transfer_report
+        .as_ref()
+        .map(|report| (report.run_id, report.attempt_id))
+        .unwrap_or((0, 0));
+    format!("{}:{}:{}", info.task_id, run_id, attempt_id)
+}
+
+fn feed_task_progress(
+    gate: &InflightBytesGate,
+    tasks: &TaskStore,
+    sampled: &Mutex<HashMap<String, i64>>,
+) {
     let mut fresh = 0i64;
+    let mut sampled = sampled.lock().unwrap_or_else(|err| err.into_inner());
     for ctx in tasks.all() {
         let size = ctx.progress().loaded_size;
         if size <= 0 {
             continue;
         }
-        let id = ctx.info.task_id.clone();
-        let prev = sampled.get(&id).map(|bytes| *bytes).unwrap_or(0);
+        let key = sample_key(&ctx.info);
+        let prev = sampled.get(&key).copied().unwrap_or(0);
         if size > prev {
-            sampled.insert(id, size);
+            sampled.insert(key, size);
             fresh += size - prev;
         }
     }
@@ -1288,10 +1316,39 @@ mod progress_feed_tests {
     }
 
     #[test]
+    fn probe_sampling_uses_the_slower_report_interval() {
+        use std::time::Duration;
+        assert_eq!(
+            probe_sample_interval(Duration::from_secs(2), Duration::from_secs(10)),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            probe_sample_interval(Duration::from_secs(10), Duration::from_secs(2)),
+            Duration::from_secs(10)
+        );
+    }
+
+    #[test]
+    fn sample_keys_are_scoped_to_run_and_attempt() {
+        let mut info = task("same");
+        info.transfer_report = Some(curvine_model::TransferTaskReportInfo {
+            run_id: 7,
+            attempt_id: 1,
+            worker_id: 1,
+            worker_session_id: "s".to_string(),
+            report_target: String::new(),
+            report_endpoints: Vec::new(),
+        });
+        let first = sample_key(&info);
+        info.transfer_report.as_mut().unwrap().attempt_id = 2;
+        assert_ne!(first, sample_key(&info));
+    }
+
+    #[test]
     fn progress_feed_counts_only_new_bytes() {
         let gate = InflightBytesGate::new(1024 * 1024);
         let store = TaskStore::new();
-        let sampled = DashMap::new();
+        let sampled = Mutex::new(HashMap::new());
         let first = store.insert(task("t1"));
         let second = store.insert(task("t2"));
 
