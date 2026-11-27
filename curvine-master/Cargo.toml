@@ -29,7 +29,7 @@ curvine-error = { workspace = true, features = ["axum-response"] }
 curvine-codec = { workspace = true }
 curvine-data-transfer = { workspace = true, features = ["opendal-s3", "transfer"] }
 curvine-transfer-client = { workspace = true }
-curvine-unified-fs = { workspace = true }
+curvine-unified-fs = { workspace = true, features = ["opendal-s3", "opendal-oss"] }
 curvine-ufs-api = { workspace = true }
 curvine-client-core = { workspace = true }
 curvine-web = { workspace = true }

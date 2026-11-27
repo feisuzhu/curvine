@@ -45,6 +45,8 @@ pub use self::master_metrics::*;
 mod router_handler;
 pub use self::router_handler::*;
 
+pub(crate) mod cache_api;
+
 pub use curvine_data_transfer::RpcContext;
 
 pub mod mount;

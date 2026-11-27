@@ -26,12 +26,14 @@ use curvine_rpc::handler::{HandlerService, LimitConf};
 use curvine_rpc::server::{RpcServer, ServerStateListener};
 use curvine_runtime::common::{LocalTime, Logger};
 use curvine_runtime::runtime::{AsyncRuntime, GroupExecutor, RpcRuntime, Runtime};
+use curvine_transfer_client::TransferClient;
 use curvine_web::server::{WebHandlerService, WebServer};
 use log::{error, info};
 
 use crate::master::fs::{FsRetryCache, MasterActor, MasterFilesystem};
 use crate::master::journal::JournalSystem;
 use crate::master::replication::master_replication_manager::MasterReplicationManager;
+use crate::master::cache_api::CacheApiState;
 use crate::master::router_handler::MasterRouterHandler;
 use crate::master::{MasterHandler, MountManager};
 use crate::master::{MasterMetrics, MasterMonitor, SyncWorkerManager};
@@ -149,6 +151,18 @@ impl WebHandlerService for MasterService {
     type Item = MasterRouterHandler;
 
     fn get_handler(&self) -> Self::Item {
+        // The cache API serves jobs from the embedded service when this master
+        // runs one; otherwise it proxies to the standalone transfer deployment.
+        let transfer_client = if self.embedded_transfer.is_none() {
+            TransferClient::with_rt(&self.conf, self.rt.clone()).ok()
+        } else {
+            None
+        };
+        let cache_api = CacheApiState {
+            mount_manager: self.mount_manager.clone(),
+            transfer: self.embedded_transfer.clone(),
+            transfer_client,
+        };
         MasterRouterHandler::new(
             self.conf.clone(),
             self.fs.clone(),
@@ -156,6 +170,7 @@ impl WebHandlerService for MasterService {
             self.fault_http.clone(),
             self.journal_store.clone(),
             self.rt.clone(),
+            cache_api,
         )
     }
 }

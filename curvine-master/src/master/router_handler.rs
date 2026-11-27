@@ -33,6 +33,7 @@ use curvine_runtime::runtime::Runtime;
 use curvine_web::router::RouterHandler;
 use futures::future::BoxFuture;
 
+use crate::master::cache_api::{self, CacheApiState};
 use crate::master::fs::{MasterFilesystem, SessionSummary};
 use crate::master::MasterMetrics;
 
@@ -66,6 +67,9 @@ pub struct MasterRouterHandler {
     /// Serializes the rendering of the metrics text output, so that concurrent
     /// scrapes never interleave partially observed values.
     render_lock: Arc<Mutex<()>>,
+    /// Mount table and the job owner for `/api/mounts`, `/api/ufs/list` and the
+    /// load/export job routes ClusterBoard reads.
+    cache_api: CacheApiState,
 }
 
 impl MasterRouterHandler {
@@ -76,6 +80,7 @@ impl MasterRouterHandler {
         fault_http: FaultHttpControl,
         journal_store: RocksLogStorage,
         rt: Arc<Runtime>,
+        cache_api: CacheApiState,
     ) -> Self {
         // A master's own `client.master_addrs` is normally empty, so
         // `master_nodes()` would only contain this standby. Build the client
@@ -120,6 +125,7 @@ impl MasterRouterHandler {
             journal_store,
             standby_client,
             render_lock: Arc::new(Mutex::new(())),
+            cache_api,
         }
     }
 
@@ -434,6 +440,7 @@ impl RouterHandler for MasterRouterHandler {
             .route("/get-dcm", get(get_dcm))
             .route("/remove-dcm", get(remove_dcm))
             .route("/api/sessions", get(sessions))
+            .merge(cache_api::router(self.cache_api.clone()))
             .layer(Extension(instance));
 
         self.fault_http.mount(router)
